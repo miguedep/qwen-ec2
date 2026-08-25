@@ -1,0 +1,38 @@
+{
+  "LOG": true,
+  "HOST": "127.0.0.1",
+  "PORT": 3456,
+  "API_TIMEOUT_MS": 1200000,
+  "Providers": [
+    {
+      "name": "qwen-ec2",
+      "api_base_url": "http://127.0.0.1:8000/v1/chat/completions",
+      "api_key": "not-used",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "transformer": {
+        "use": [
+          "openai",
+          [
+            "sampling",
+            {
+              "max_tokens": 8192,
+              "temperature": 1.0,
+              "top_p": 0.95,
+              "top_k": 20
+            }
+          ]
+        ]
+      }
+    }
+  ],
+  "Router": {
+    "default": "qwen-ec2,qwen3.8-27b",
+    "background": "qwen-ec2,qwen3.8-27b",
+    "think": "qwen-ec2,qwen3.8-27b",
+    "longContext": "qwen-ec2,qwen3.8-27b",
+    "longContextThreshold": 60000,
+    "webSearch": "qwen-ec2,qwen3.8-27b"
+  }
+}

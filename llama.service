@@ -1,0 +1,38 @@
+# /etc/systemd/system/llama.service
+[Unit]
+Description=llama.cpp OpenAI-compatible server (Qwen3.8-27B Uncensored Q8_0)
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStartSec=0
+ExecStartPre=-/usr/bin/docker rm -f llama
+ExecStart=/usr/bin/docker run --rm --name llama \
+  --gpus all \
+  -p 127.0.0.1:8000:8000 \
+  -v /opt/models:/models \
+  ghcr.io/ggml-org/llama.cpp:server-cuda \
+  --model /models/Qwen3.8-27B-Uncensored-Q8_0.gguf \
+  --alias qwen3.8-27b \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --n-gpu-layers 99 \
+  --ctx-size 262144 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --flash-attn on \
+  --parallel 1 \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 1 \
+  --jinja \
+  --chat-template-file /models/chat_template.jinja \
+  --reasoning-format deepseek \
+  --chat-template-kwargs '{"reasoning_effort":"medium"}' \
+  --cache-prompt \
+  --cache-reuse 256
+ExecStop=/usr/bin/docker stop llama
+
+[Install]
+WantedBy=multi-user.target

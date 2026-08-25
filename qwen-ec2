@@ -1,0 +1,511 @@
+#!/usr/bin/env bash
+# Control the Qwen3.8-27B Uncensored Q8_0 llama.cpp inference host on EC2.
+#
+#   qwen-ec2 start     boot the instance, wait for the API, refresh ~/.ssh/config
+#   (qwen3-ec2 is the same command; install-client.sh installs both names)
+#   qwen-ec2 stop      shut it down (compute billing stops; EBS keeps billing)
+#   qwen-ec2 code      launch Claude Code against the model (reconnects first)
+#   qwen-ec2 status    instance state, public IP, API health, hourly cost
+#   qwen-ec2 ssh       interactive shell on the box
+#   qwen-ec2 tunnel    forward localhost:8000 -> llama-server over SSH (foreground)
+#   qwen-ec2 tunnel-bg   supervised background tunnel that self-heals on drops
+#   qwen-ec2 tunnel-kill close the background tunnel, leaving the instance up
+#   qwen-ec2 tunnel-ssm  same, over SSM: no public IP, no open port, no SSH key
+#   qwen-ec2 bootstrap set up a fresh laptop (SSM plugin + OpenCode + config)
+#   qwen-ec2 up        start + tunnel in the background, ready to use
+#   qwen-ec2 down      close the tunnel and stop the instance
+#   qwen-ec2 logs      follow the llama-server log
+#   qwen-ec2 boot-log  follow first-boot provisioning (model download etc.)
+#
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+# Instance identity lives in a config file written by provision.sh, not in this
+# script. Hardcoding it here meant every rebuild (or a move to another AWS
+# account) required editing four constants by hand, and a stale INSTANCE_ID
+# fails in ways that look like a network problem.
+CONFIG="${QWEN_EC2_CONFIG:-$HOME/.config/qwen-ec2/config.env}"
+if [ -f "$CONFIG" ]; then
+  # shellcheck source=/dev/null
+  . "$CONFIG"
+fi
+
+: "${NAME:=qwen3-inference}"
+: "${INSTANCE_ID:=}"
+: "${ALLOCATION_ID:=}"          # empty when running without an Elastic IP
+: "${ELASTIC_IP:=}"
+: "${SSH_HOST:=qwen-gpu}"
+: "${SSH_KEY:=$HOME/.ssh/id_ed25519}"
+: "${SSH_USER:=ubuntu}"
+: "${LOCAL_PORT:=8000}"
+: "${REMOTE_PORT:=8000}"
+: "${HOURLY_USD:=1.974}"        # g6e.xlarge on-demand, eu-north-1
+: "${CHAT_TEMPLATE:=}"          # local froggeric jinja; scp'd on start if present
+export AWS_REGION="${AWS_REGION:-eu-north-1}"
+# Config wins. An empty AWS_PROFILE in config.env means the default
+# credentials chain. Unset so a leftover exported AWS_PROFILE from the
+# shell cannot survive an explicit AWS_PROFILE="" in the config.
+if [ -n "${AWS_PROFILE:-}" ]; then
+  export AWS_PROFILE
+else
+  unset AWS_PROFILE
+fi
+
+# A copied config.env keeps absolute paths from the provision laptop. Prefer
+# a key that actually exists here over a HostName that cannot open.
+if [ ! -f "$SSH_KEY" ]; then
+  for cand in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/${NAME}-key.pem"; do
+    if [ -f "$cand" ]; then SSH_KEY="$cand"; break; fi
+  done
+fi
+if [ -n "$CHAT_TEMPLATE" ] && [ ! -f "$CHAT_TEMPLATE" ]; then
+  if [ -f "$HOME/.config/qwen-ec2/chat_template.jinja" ]; then
+    CHAT_TEMPLATE="$HOME/.config/qwen-ec2/chat_template.jinja"
+  else
+    CHAT_TEMPLATE=""
+  fi
+fi
+TUNNEL_PID_FILE="$HOME/.qwen-ec2-tunnel.pid"
+TUNNEL_LOG="$HOME/.qwen-ec2-tunnel.log"
+: "${TUNNEL_SG_SYNC_INTERVAL:=60}"  # seconds between ingress re-syncs while reconnecting
+
+# Commands that talk to AWS need an instance; purely local ones do not.
+require_instance() {
+  [ -n "$INSTANCE_ID" ] || die "no INSTANCE_ID configured. Run provision.sh, or set it in $CONFIG"
+}
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+ok()   { printf '\033[32m ok\033[0m %s\n' "$*"; }
+
+state() {
+  require_instance
+  local out
+  if ! out=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].State.Name' --output text 2>&1); then
+    if printf '%s' "$out" | grep -q 'InvalidInstanceID.NotFound'; then
+      die "instance $INSTANCE_ID is not in this AWS account (region $AWS_REGION${AWS_PROFILE:+, profile $AWS_PROFILE}). Use the profile that ran provision.sh, or: unset AWS_PROFILE"
+    fi
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  printf '%s\n' "$out"
+}
+
+public_ip() {
+  require_instance
+  aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+}
+
+# An Elastic IP keeps the address stable across stop/start, so this block is
+# effectively write-once. It is still refreshed on every start so that a manual
+# EIP change (or an accidental disassociation) self-heals rather than leaving a
+# stale HostName behind.
+sync_ssh_config() {
+  local ip="$1" cfg="$HOME/.ssh/config"
+  touch "$cfg"; chmod 600 "$cfg"
+  local tmp; tmp=$(mktemp)
+  awk '
+    /^# BEGIN qwen-ec2$/ { skip=1 }
+    !skip { print }
+    /^# END qwen-ec2$/   { skip=0 }
+  ' "$cfg" > "$tmp"
+  cat >> "$tmp" <<EOF
+# BEGIN qwen-ec2
+# Managed by qwen-ec2 -- edits between these markers are overwritten.
+Host $SSH_HOST
+    HostName $ip
+    User $SSH_USER
+    IdentityFile $SSH_KEY
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+    UserKnownHostsFile $HOME/.ssh/known_hosts.qwen
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+
+# Fallback path that needs no public IP and no open port 22.
+Host ${SSH_HOST}-ssm
+    User $SSH_USER
+    IdentityFile $SSH_KEY
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+    UserKnownHostsFile $HOME/.ssh/known_hosts.qwen
+    ProxyCommand sh -c "aws ssm start-session --target $INSTANCE_ID --region $AWS_REGION --document-name AWS-StartSSHSession --parameters portNumber=%p"
+# END qwen-ec2
+EOF
+  mv "$tmp" "$cfg"; chmod 600 "$cfg"
+  # The host key is pinned per-address; a recycled IP would otherwise warn.
+  ssh-keygen -R "$ip" -f "$HOME/.ssh/known_hosts.qwen" >/dev/null 2>&1 || true
+}
+
+# The operator's home IP is dynamic; keep the SG rule pointed at it.
+sync_security_group() {
+  local sg my_ip current
+  sg=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+        --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)
+  my_ip=$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')
+  [ -n "$my_ip" ] || { info "could not detect public IP; leaving SG untouched"; return 0; }
+  current=$(aws ec2 describe-security-groups --group-ids "$sg" \
+    --query "SecurityGroups[0].IpPermissions[?FromPort==\`22\`].IpRanges[].CidrIp" --output text)
+  if [ "$current" = "$my_ip/32" ]; then return 0; fi
+  info "your IP changed ($current -> $my_ip/32); updating SG $sg"
+  for cidr in $current; do
+    aws ec2 revoke-security-group-ingress --group-id "$sg" \
+      --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$cidr}]" >/dev/null
+  done
+  aws ec2 authorize-security-group-ingress --group-id "$sg" \
+    --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$my_ip/32,Description='qwen-ec2 managed'}]" >/dev/null
+}
+
+# Diagnostic only: name the closed-ingress case, which looks identical to a
+# dead host from the laptop side.
+ingress_hint() {
+  local sg my_ip current
+  my_ip=$(curl -fsS -m 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]') || return 0
+  [ -n "$my_ip" ] || return 0
+  sg=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+        --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text 2>/dev/null) || return 0
+  current=$(aws ec2 describe-security-groups --group-ids "$sg" \
+    --query "SecurityGroups[0].IpPermissions[?FromPort==\`22\`].IpRanges[].CidrIp" --output text 2>/dev/null) || return 0
+  [ "$current" = "$my_ip/32" ] && return 0
+  printf ' (SG allows %s, you are %s/32; run: qwen-ec2 start)' "${current:-nothing}" "$my_ip"
+}
+
+# Does the local end of the tunnel actually serve the model right now? This is
+# the only check that means anything: the port can be forwarded while
+# llama-server is down, and the pidfile can look fine while nothing is listening.
+tunnel_healthy() {
+  curl -fsS -m 3 -o /dev/null "http://127.0.0.1:$LOCAL_PORT/health" 2>/dev/null
+}
+
+# `kill -0` alone trusts a recycled PID, which is how `status` once reported a
+# tunnel that had been dead for hours. Match the command line as well.
+supervisor_alive() {
+  [ -f "$TUNNEL_PID_FILE" ] || return 1
+  local pid; pid=$(cat "$TUNNEL_PID_FILE" 2>/dev/null) || return 1
+  [ -n "$pid" ] || return 1
+  ps -p "$pid" -o command= 2>/dev/null | grep -q 'qwen-ec2'
+}
+
+# EC2 user-data cannot carry chat_template.jinja (16 KB cap). Push the pinned
+# copy from this laptop when we have it; later starts on another laptop skip
+# this and use the file already on EBS.
+sync_chat_template() {
+  [ -n "$CHAT_TEMPLATE" ] && [ -f "$CHAT_TEMPLATE" ] || return 0
+  local remote="/opt/models/chat_template.jinja"
+  local local_sum remote_sum
+  local_sum=$(md5 -q "$CHAT_TEMPLATE")
+  remote_sum=$(ssh -o ConnectTimeout=5 "$SSH_HOST" \
+    "sudo mkdir -p /opt/models; md5sum $remote 2>/dev/null | awk '{print \$1}'" \
+    || true)
+  if [ "$local_sum" = "$remote_sum" ]; then
+    return 0
+  fi
+  info "copying chat template to the instance"
+  scp -q "$CHAT_TEMPLATE" "$SSH_HOST:/tmp/chat_template.jinja"
+  ssh "$SSH_HOST" "sudo install -o ubuntu -g ubuntu -m 644 /tmp/chat_template.jinja $remote && sudo systemctl try-restart llama.service || true"
+}
+
+wait_for_server() {
+  info "waiting for llama-server to report healthy (first boot downloads 29 GB, allow ~20 min)"
+  local i
+  for i in $(seq 1 240); do
+    if ssh -o ConnectTimeout=5 "$SSH_HOST" \
+         'curl -fsS -m 3 http://127.0.0.1:8000/health >/dev/null 2>&1'; then
+      ok "llama-server is serving"; return 0
+    fi
+    printf '.'; sleep 15
+  done
+  echo
+  die "llama-server did not become healthy in 60 min. Inspect: qwen-ec2 boot-log"
+}
+
+cmd_start() {
+  local s; s=$(state)
+  case "$s" in
+    running) info "already running" ;;
+    stopped) info "starting $INSTANCE_ID"
+             aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
+             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" ;;
+    stopping) info "instance is stopping; waiting for it to settle first"
+              aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+              cmd_start; return ;;
+    *) die "instance is '$s'; cannot start" ;;
+  esac
+  sync_security_group
+  local ip; ip=$(public_ip)
+  sync_ssh_config "$ip"
+  ok "running at $ip (ssh $SSH_HOST)"
+  info "waiting for sshd"
+  until ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" true 2>/dev/null; do printf '.'; sleep 5; done
+  echo
+  sync_chat_template
+  wait_for_server
+}
+
+cmd_stop() {
+  local s; s=$(state)
+  [ "$s" = "stopped" ] && { info "already stopped"; return 0; }
+  info "stopping $INSTANCE_ID"
+  aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
+  aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+  ok "stopped. Compute billing has ended; the 100 GB gp3 @ 625 MB/s (~\$29/mo) and the idle Elastic IP (~\$3.6/mo) continue."
+}
+
+cmd_status() {
+  local s ip; s=$(state)
+  printf 'instance : %s (%s, g6e.xlarge, 1x L40S 48GB)\n' "$INSTANCE_ID" "$s"
+  if [ "$s" = "running" ]; then
+    ip=$(public_ip)
+    printf 'public IP: %s\n' "$ip"
+    printf 'cost     : ~$%s/h while running\n' "$HOURLY_USD"
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" \
+         'curl -fsS -m 3 http://127.0.0.1:8000/health >/dev/null' 2>/dev/null; then
+      printf 'llama    : healthy\n'
+      ssh "$SSH_HOST" 'curl -fsS http://127.0.0.1:8000/v1/models' 2>/dev/null \
+        | python3 -c 'import sys,json;print("model    :", ", ".join(m["id"] for m in json.load(sys.stdin)["data"]))' 2>/dev/null || true
+      ssh "$SSH_HOST" 'nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader' 2>/dev/null \
+        | sed 's/^/gpu      : /' || true
+    elif ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" true 2>/dev/null; then
+      # An unreachable host is almost always closed ingress, not a slow model,
+      # so say so instead of blaming llama-server.
+      printf 'llama    : unknown; cannot reach the host over SSH%s\n' "$(ingress_hint)"
+    else
+      printf 'llama    : not responding (still loading? try: qwen-ec2 boot-log)\n'
+    fi
+  else
+    if [ -n "$ELASTIC_IP" ]; then
+      printf 'public IP: %s (Elastic IP, reserved while stopped)\n' "$ELASTIC_IP"
+      printf 'cost     : $0/h compute, ~$18/mo EBS + ~$3.6/mo idle EIP\n'
+    else
+      printf 'public IP: none while stopped (no Elastic IP; address changes on each start)\n'
+      printf 'cost     : $0/h compute, ~$18/mo EBS\n'
+    fi
+  fi
+  if tunnel_healthy; then
+    if supervisor_alive; then
+      printf 'tunnel   : up on localhost:%s, supervised (pid %s)\n' "$LOCAL_PORT" "$(cat "$TUNNEL_PID_FILE")"
+    else
+      printf 'tunnel   : up on localhost:%s, unsupervised (will not self-heal)\n' "$LOCAL_PORT"
+    fi
+  elif supervisor_alive; then
+    printf 'tunnel   : supervisor running but port %s is not serving (reconnecting? see %s)\n' "$LOCAL_PORT" "$TUNNEL_LOG"
+  else
+    printf 'tunnel   : down\n'
+  fi
+}
+
+# Launch Claude Code against the local model.
+#
+# ENABLE_CLAUDEAI_MCP_SERVERS=0 suppresses the "claude.ai connectors are
+# disabled because ANTHROPIC_API_KEY or another auth source is set" notice.
+# ccr must set ANTHROPIC_AUTH_TOKEN for Claude Code to authenticate to the
+# router, and any auth env var trips that warning. Claude Code only emits the
+# notice when it *silently* skips connectors; being told explicitly not to load
+# them takes an earlier branch that stays quiet. Connectors genuinely cannot
+# work against a non-Anthropic backend, so this states the truth rather than
+# hiding a problem.
+#
+# Scoped to this command on purpose: plain `claude` keeps your claude.ai
+# connectors, because the variable is never exported to the shell.
+#
+# The preflight is not politeness. ccr surfaces a refused upstream as a bare
+# `TypeError: fetch failed`, which Claude Code turns into a 500 and retries for
+# ~10 minutes behind "check your network" -- a message that points at the one
+# thing which is never the cause. Reconnecting here, or failing in one line,
+# beats that every time.
+cmd_code() {
+  command -v ccr >/dev/null || die "ccr not on PATH; open a new shell or run: qwen-ec2 bootstrap"
+  if ! tunnel_healthy; then
+    info "nothing healthy on localhost:$LOCAL_PORT; reconnecting before launch"
+    [ "$(state)" = "running" ] || die "instance is '$(state)'; run: qwen-ec2 start"
+    cmd_tunnel_bg
+  fi
+  # --dangerously-skip-permissions, not --allow-dangerously-skip-permissions:
+  # the "allow-" variant only makes bypass *available* and still starts the
+  # session in manual mode. This one actually bypasses.
+  # CCR 3 treats a bare `code` argument as a profile name. The profile
+  # install-client / this machine already ships is `default-claude-code`.
+  ccr start --no-open >/dev/null 2>&1 || true
+  ENABLE_CLAUDEAI_MCP_SERVERS=0 exec ccr default-claude-code -- --dangerously-skip-permissions "$@"
+}
+
+cmd_ssh()      { exec ssh "$SSH_HOST" "$@"; }
+cmd_logs()     { exec ssh -t "$SSH_HOST" 'sudo journalctl -u llama -f -n 200'; }
+cmd_boot_log() { exec ssh -t "$SSH_HOST" 'sudo tail -f -n 200 /var/log/qwen-bootstrap.log'; }
+
+cmd_tunnel() {
+  [ "$(state)" = "running" ] || die "instance is not running; run: qwen-ec2 start"
+  info "forwarding localhost:$LOCAL_PORT -> $SSH_HOST:$REMOTE_PORT (Ctrl-C to stop)"
+  exec ssh -N -L "127.0.0.1:$LOCAL_PORT:127.0.0.1:$REMOTE_PORT" "$SSH_HOST"
+}
+
+# Port-forward over SSM instead of SSH. Needs no inbound security-group rule,
+# no public IP and no SSH key on this machine -- only AWS credentials and the
+# session-manager-plugin. This is the path other laptops should use.
+cmd_tunnel_ssm() {
+  [ "$(state)" = "running" ] || die "instance is not running; run: qwen-ec2 start"
+  command -v session-manager-plugin >/dev/null \
+    || die "session-manager-plugin not on PATH; run: qwen-ec2 bootstrap"
+  info "SSM port-forward localhost:$LOCAL_PORT -> instance:$REMOTE_PORT (Ctrl-C to stop)"
+  exec aws ssm start-session --target "$INSTANCE_ID" --region "$AWS_REGION" \
+    --document-name AWS-StartPortForwardingSession \
+    --parameters "portNumber=$REMOTE_PORT,localPortNumber=$LOCAL_PORT"
+}
+
+# Make a fresh laptop ready: SSM plugin, OpenCode, and the provider config.
+# Deliberately installs nothing that needs root.
+cmd_bootstrap() {
+  mkdir -p "$HOME/bin"
+
+  if command -v session-manager-plugin >/dev/null; then
+    ok "session-manager-plugin present ($(session-manager-plugin --version))"
+  else
+    info "installing session-manager-plugin into ~/bin (no sudo needed)"
+    local arch plat tmp
+    arch=$(uname -m); case "$arch" in arm64) plat=mac_arm64;; *) plat=mac;; esac
+    tmp=$(mktemp -d)
+    curl -fsSL -o "$tmp/smp.zip" \
+      "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/$plat/sessionmanager-bundle.zip"
+    unzip -q "$tmp/smp.zip" -d "$tmp"
+    install -m 755 "$tmp/sessionmanager-bundle/bin/session-manager-plugin" "$HOME/bin/"
+    xattr -d com.apple.quarantine "$HOME/bin/session-manager-plugin" 2>/dev/null || true
+    rm -rf "$tmp"
+    ok "session-manager-plugin installed"
+  fi
+
+  if command -v opencode >/dev/null; then
+    ok "opencode present ($(opencode --version 2>&1 | head -1))"
+  else
+    info "installing opencode"
+    npm install -g opencode-ai@latest >/dev/null 2>&1 || die "npm install opencode-ai failed"
+    ok "opencode installed"
+  fi
+
+  local cfg="$HOME/.config/opencode/opencode.json"
+  if [ -f "$cfg" ]; then
+    info "leaving existing $cfg untouched"
+  else
+    mkdir -p "$(dirname "$cfg")"
+    cat > "$cfg" <<'JSON'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "qwen-ec2": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Qwen3.8-27B Uncensored (EC2 L40S)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "not-used"
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Qwen3.8-27B Uncensored Q8_0 (L40S)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": { "context": 65536, "output": 8192 },
+          "options": { "temperature": 1.0, "top_p": 0.95, "top_k": 20 }
+        }
+      }
+    }
+  },
+  "model": "qwen-ec2/qwen3.8-27b"
+}
+JSON
+    ok "wrote $cfg"
+  fi
+
+  printf '\n'
+  info "next: aws sso login   then   qwen-ec2 start && qwen-ec2 tunnel-ssm"
+  info "then in another terminal: opencode"
+  case ":$PATH:" in *":$HOME/bin:"*) ;; *)
+    printf '\033[33mnote:\033[0m add ~/bin to PATH:  echo '"'"'export PATH="$HOME/bin:$PATH"'"'"' >> ~/.zshrc\n' ;;
+  esac
+}
+
+cmd_up() {
+  cmd_start
+  cmd_tunnel_bg
+  ok "ready. Endpoint: http://127.0.0.1:$LOCAL_PORT/v1  |  launch Claude Code with: ccr code"
+}
+
+# Reconnect loop. A plain `ssh -f -N` is unsupervised, so one laptop sleep or
+# one home-IP change killed the forward for good and left every later request
+# hitting a refused port. ServerAlive* bounds how long a half-dead link can
+# pretend to work before ssh gives up and this loop replaces it.
+#
+# Reconnecting is not enough on its own: an IP change closes SSH ingress, so
+# every retry times out and the loop spins forever while the Router answers
+# `500 fetch failed`. Re-point the SG from inside the loop, throttled so a
+# genuinely unreachable host does not turn into an AWS API hot loop.
+cmd_supervise_tunnel() {
+  local last_sg_sync=0 now
+  while :; do
+    ssh -N \
+        -o ExitOnForwardFailure=yes \
+        -o ConnectTimeout=10 \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+        -L "127.0.0.1:$LOCAL_PORT:127.0.0.1:$REMOTE_PORT" "$SSH_HOST" || true
+    now=$(date +%s)
+    if [ $(( now - last_sg_sync )) -ge "$TUNNEL_SG_SYNC_INTERVAL" ]; then
+      last_sg_sync=$now
+      sync_security_group || printf '%s security-group re-sync failed\n' "$(date '+%F %T')"
+    fi
+    printf '%s tunnel down; reconnecting in 5s\n' "$(date '+%F %T')"
+    sleep 5
+  done
+}
+
+cmd_tunnel_bg() {
+  if supervisor_alive && tunnel_healthy; then
+    info "tunnel already up on localhost:$LOCAL_PORT"; return 0
+  fi
+  cmd_tunnel_kill >/dev/null 2>&1 || true
+  info "starting supervised tunnel (log: $TUNNEL_LOG)"
+  nohup "$SELF" supervise-tunnel >>"$TUNNEL_LOG" 2>&1 &
+  echo $! > "$TUNNEL_PID_FILE"
+  local i
+  for i in $(seq 1 20); do
+    tunnel_healthy && { ok "tunnel up on http://127.0.0.1:$LOCAL_PORT/v1"; return 0; }
+    sleep 1
+  done
+  die "tunnel did not become healthy in 20s; see $TUNNEL_LOG"
+}
+
+cmd_tunnel_kill() {
+  local killed=0
+  if [ -f "$TUNNEL_PID_FILE" ]; then
+    kill "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null && killed=1 || true
+    rm -f "$TUNNEL_PID_FILE"
+  fi
+  # The ssh child outlives its supervisor, and pre-supervisor `ssh -f -N`
+  # tunnels may still be around, so match on the forward spec itself.
+  pkill -f "$LOCAL_PORT:127.0.0.1:$REMOTE_PORT" 2>/dev/null && killed=1 || true
+  if [ "$killed" = 1 ]; then ok "tunnel closed"; else info "no tunnel to close"; fi
+}
+
+cmd_down() { cmd_tunnel_kill; cmd_stop; }
+
+case "${1:-}" in
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  status|"") cmd_status ;;
+  code)      shift; cmd_code "$@" ;;
+  ssh)       shift; cmd_ssh "$@" ;;
+  tunnel)    cmd_tunnel ;;
+  tunnel-ssm) cmd_tunnel_ssm ;;
+  bootstrap) cmd_bootstrap ;;
+  up)        cmd_up ;;
+  down)      cmd_down ;;
+  logs)      cmd_logs ;;
+  boot-log)  cmd_boot_log ;;
+  # Print the contiguous comment header, stopping at the first non-comment line.
+  -h|--help|help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0" ;;
+  tunnel-bg)   cmd_tunnel_bg ;;
+  tunnel-kill) cmd_tunnel_kill ;;
+  # Internal: the reconnect loop that `tunnel-bg` backgrounds. Not in --help.
+  supervise-tunnel) cmd_supervise_tunnel ;;
+  *)         die "unknown command '$1' (try: qwen-ec2 --help)" ;;
+esac
