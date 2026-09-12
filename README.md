@@ -1,7 +1,8 @@
 # qwen-ec2
 
-A single-GPU EC2 host serving **Qwen3.8-27B Uncensored Q8_0** (Coletti GGUF)
-through llama.cpp's OpenAI-compatible API, reachable only over an SSH tunnel,
+A single-GPU EC2 host serving **Qwen3.8-27B TURBO-Fable-Cold-Fusion NEO-CODER-MAX
+(MTP) Uncensored Q8_0** (DavidAU GGUF) through llama.cpp's OpenAI-compatible API,
+reachable only over an SSH tunnel,
 driven from Claude Code via
 [claude-code-router](https://github.com/musistudio/claude-code-router) (`ccr`).
 
@@ -291,7 +292,7 @@ If you change the systemd unit by hand, write the change back into
 | `--cache-type-k/v q8_0` | Quantized KV so 256k fits next to 29 GB weights on 48 GB |
 | `--flash-attn on` | Decode path; do not leave on auto |
 | `--parallel 1` | One Operator, one conversation; the whole context is one slot |
-| `--spec-type draft-mtp --spec-draft-n-max 1` | Fused MTP; n_max 1 is the fastest point on Coletti's tables |
+| `--spec-type draft-mtp --spec-draft-n-max 1` | Fused MTP draft head; n_max 1 is the fastest point observed for this GGUF |
 | `--jinja --chat-template-file …` | Patched template; stock file 500s Claude Code |
 | `--reasoning-format deepseek` | Thinking goes to `reasoning_content`, not the tool-call stream |
 | `--chat-template-kwargs medium` | Thinking on, not Qwen's xhigh (burns the 8192 output budget) |

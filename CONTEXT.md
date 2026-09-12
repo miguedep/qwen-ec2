@@ -13,11 +13,11 @@ The SSH or SSM port-forward that makes the Inference Host's loopback API appear 
 _Avoid_: VPN, public endpoint, API gateway
 
 **Served Model**:
-JonathanColetti's Heretic-abliterated Qwen3.8-27B at Q8_0 GGUF (`Qwen3.8-27B-Uncensored-Q8_0.gguf`, 29 GB fused). This replaced Qwen3-32B-FP8.
-_Avoid_: Qwen3-32B, FP8, "the 8-bit model" (FP8 was also 8-bit), Qwen 3.8 as a cloud product
+DavidAU's Qwen3.8-27B TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX (MTP) at Q8_0 GGUF (`Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q8_0.gguf`, ~30 GB fused). A multi-stage fusion of Fable-Fusion-711-Uncensored-Heretic and Cold-Fusion-GAIN-V1.1 with Heretic de-censoring applied post-merge. This replaced JonathanColetti's Heretic-abliterated Qwen3.8-27B Uncensored (which itself replaced Qwen3-32B-FP8).
+_Avoid_: Qwen3-32B, FP8, "the 8-bit model" (FP8 was also 8-bit), Qwen 3.8 as a cloud product, Coletti (that was the prior fine-tune)
 
 **Uncensored**:
-Refusal-reduced: 98/100 → 12/100 on one held-out harmful-prompt set, KL 0.1191 from the base Qwen3.8-27B. Refusals are reduced, not eliminated. Accuracy is unchanged.
+Refusal-reduced in two stages: 99/100 → 0/100 (KL 0.0535), then 11/100 (KL 0.0025), against the base Qwen3.8-27B. Refusals are reduced, not eliminated. DavidAU claims accuracy improved, not degraded, over the base model (735 ARC-C / 882 ARC-E vs. 591 ARC-C base, 8-bit).
 _Avoid_: unrestricted, jailbroken, unfiltered, "no safety"
 
 **Coding Agent**:

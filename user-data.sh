@@ -1,6 +1,7 @@
 #!/bin/bash
-# Provision llama.cpp serving the Coletti Qwen3.8-27B Uncensored Q8_0 GGUF
-# on a single L40S (48 GB). Runs once at first boot; safe to re-run.
+# Provision llama.cpp serving DavidAU's Qwen3.8-27B TURBO-Fable-Cold-Fusion
+# NEO-CODER-MAX (MTP) Q8_0 GGUF on a single L40S (48 GB). Runs once at first
+# boot; safe to re-run.
 #
 # The chat template is NOT in this script: EC2 user-data is capped at 16 KB
 # and froggeric v22.3 is ~26 KB. provision.sh / qwen-ec2 start scp
@@ -8,8 +9,8 @@
 set -euxo pipefail
 exec > >(tee -a /var/log/qwen-bootstrap.log) 2>&1
 
-HF_REPO="JonathanColetti/Qwen3.8-27B-Uncensored-GGUF"
-GGUF="Qwen3.8-27B-Uncensored-Q8_0.gguf"
+HF_REPO="DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF"
+GGUF="Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q8_0.gguf"
 MODEL_DIR="/opt/models"
 
 mkdir -p "$MODEL_DIR"
@@ -35,7 +36,7 @@ chown -R ubuntu:ubuntu "$MODEL_DIR"
 # this GGUF is 29 GB, so --no-mmap / --mlock will OOM.
 cat >/etc/systemd/system/llama.service <<'UNIT'
 [Unit]
-Description=llama.cpp OpenAI-compatible server (Qwen3.8-27B Uncensored Q8_0)
+Description=llama.cpp OpenAI-compatible server (Qwen3.8-27B TURBO-Fable-Cold-Fusion NEO-CODER-MAX MTP Q8_0)
 After=docker.service network-online.target
 Requires=docker.service
 
@@ -49,7 +50,7 @@ ExecStart=/usr/bin/docker run --rm --name llama \
   -p 127.0.0.1:8000:8000 \
   -v /opt/models:/models \
   ghcr.io/ggml-org/llama.cpp:server-cuda \
-  --model /models/Qwen3.8-27B-Uncensored-Q8_0.gguf \
+  --model /models/Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q8_0.gguf \
   --alias qwen3.8-27b \
   --host 0.0.0.0 \
   --port 8000 \

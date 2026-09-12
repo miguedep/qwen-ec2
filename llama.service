@@ -1,6 +1,6 @@
 # /etc/systemd/system/llama.service
 [Unit]
-Description=llama.cpp OpenAI-compatible server (Qwen3.8-27B Uncensored Q8_0)
+Description=llama.cpp OpenAI-compatible server (Qwen3.8-27B TURBO-Fable-Cold-Fusion NEO-CODER-MAX MTP Q8_0)
 After=docker.service network-online.target
 Requires=docker.service
 
@@ -14,7 +14,7 @@ ExecStart=/usr/bin/docker run --rm --name llama \
   -p 127.0.0.1:8000:8000 \
   -v /opt/models:/models \
   ghcr.io/ggml-org/llama.cpp:server-cuda \
-  --model /models/Qwen3.8-27B-Uncensored-Q8_0.gguf \
+  --model /models/Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q8_0.gguf \
   --alias qwen3.8-27b \
   --host 0.0.0.0 \
   --port 8000 \
