@@ -326,10 +326,11 @@ cmd_code() {
   # --dangerously-skip-permissions, not --allow-dangerously-skip-permissions:
   # the "allow-" variant only makes bypass *available* and still starts the
   # session in manual mode. This one actually bypasses.
-  # CCR 3 treats a bare `code` argument as a profile name. The profile
-  # install-client / this machine already ships is `default-claude-code`.
+  # `ccr code` (not a profile name -- ccr 1.0.73 has no such concept) forwards
+  # its args straight to `claude`. A `--` before the flags breaks that
+  # forwarding (claude then reports the prompt missing), so pass them bare.
   ccr start --no-open >/dev/null 2>&1 || true
-  ENABLE_CLAUDEAI_MCP_SERVERS=0 exec ccr default-claude-code -- --dangerously-skip-permissions "$@"
+  ENABLE_CLAUDEAI_MCP_SERVERS=0 exec ccr code --dangerously-skip-permissions "$@"
 }
 
 cmd_ssh()      { exec ssh "$SSH_HOST" "$@"; }
