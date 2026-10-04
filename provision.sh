@@ -6,6 +6,8 @@
 #   ./provision.sh                  create everything, using defaults below
 #   ./provision.sh --with-eip       also allocate an Elastic IP (~$3.6/mo idle)
 #   ./provision.sh --with-opencode  also install opencode, ready to use
+#   ./provision.sh --spot           persistent spot instance, stopped (not
+#                                   terminated) on interruption
 #   ./provision.sh --dry-run        print what would happen, touch nothing
 #
 # Idempotent: every resource is looked up before it is created, so re-running
@@ -34,10 +36,12 @@ VCPUS_NEEDED=4
 
 WITH_EIP=0
 DRY_RUN=0
+SPOT=0
 CLIENT_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --with-eip) WITH_EIP=1 ;;
+    --spot)     SPOT=1 ;;
     --with-opencode) CLIENT_ARGS+=("--with-opencode") ;;
     --dry-run)  DRY_RUN=1 ;;
     -h|--help)  sed -n '2,/^set -euo/p' "$0" | sed -E 's/^# ?//;/^set -euo/d'; exit 0 ;;
@@ -58,6 +62,18 @@ aws sts get-caller-identity >/dev/null 2>&1 || die "no valid AWS credentials (tr
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 info "account $ACCOUNT, region $AWS_REGION, name prefix $NAME"
 [ "$DRY_RUN" = 1 ] && info "DRY RUN: nothing will be created"
+
+MARKET_ARGS=()
+SPOT_TAGS=()
+if [ "$SPOT" = 1 ]; then
+  # Spot draws on a separate quota: "All G and VT Spot Instance Requests".
+  GPU_QUOTA_CODE="L-3819A6DF"
+  # Persistent + stop keeps the root volume (and the 29 GB GGUF) across
+  # interruptions, and is the only spot mode that allows `qwen-ec2 down`.
+  MARKET_ARGS=(--instance-market-options
+    'MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}')
+  SPOT_TAGS=("ResourceType=spot-instances-request,Tags=[{Key=Name,Value=$NAME},{Key=Owner,Value=${OWNER:-$USER}}]")
+fi
 
 # ---------------------------------------------------------------- 0. GPU quota
 # Checked first because a fresh account has a quota of zero here, the request
@@ -204,13 +220,19 @@ else
         --metadata-options 'HttpTokens=required,HttpPutResponseHopLimit=2,HttpEndpoint=enabled' \
         --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$VOLUME_GB,\"VolumeType\":\"gp3\",\"Throughput\":$VOLUME_THROUGHPUT,\"Encrypted\":true,\"DeleteOnTermination\":true}}]" \
         --user-data "file://user-data.sh" \
+        ${MARKET_ARGS[@]:+"${MARKET_ARGS[@]}"} \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Owner,Value=${OWNER:-$USER}},{Key=Purpose,Value=qwen3.8-27b-q8-gguf}]" \
+          ${SPOT_TAGS[@]:+"${SPOT_TAGS[@]}"} \
         --query 'Instances[0].InstanceId' --output text 2>&1); then
         INSTANCE_ID="$out"
         break
       fi
       if printf '%s\n' "$out" | grep -q InsufficientInstanceCapacity; then
         skip "no $INSTANCE_TYPE capacity in $AZ"
+        continue
+      fi
+      if printf '%s\n' "$out" | grep -q '(Unsupported)'; then
+        skip "$INSTANCE_TYPE not offered in $AZ"
         continue
       fi
       die "$out"

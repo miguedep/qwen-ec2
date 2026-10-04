@@ -68,6 +68,14 @@ fi
 # ------------------------------------------------------------- 2. instance
 if [ -n "${INSTANCE_ID:-}" ] && aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
      --query 'Reservations[0].Instances[0].State.Name' --output text >/dev/null 2>&1; then
+  # A persistent spot request outlives its instance and launches a replacement,
+  # so it must be cancelled first.
+  SPOT_REQ=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].SpotInstanceRequestId' --output text 2>/dev/null || echo None)
+  if [ "$SPOT_REQ" != "None" ] && [ -n "$SPOT_REQ" ]; then
+    info "cancelling spot request $SPOT_REQ"
+    run aws ec2 cancel-spot-instance-requests --spot-instance-request-ids "$SPOT_REQ"
+  fi
   info "terminating $INSTANCE_ID"
   run aws ec2 terminate-instances --instance-ids "$INSTANCE_ID"
   # Wait: the ENI must be released before the security group can be deleted.
